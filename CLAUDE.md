@@ -75,6 +75,16 @@ outside `WORKSPACE` (e.g. an stdio MCP server's install dir), via `EXTRA_CREATE_
 - **Everything mutating goes through `run`/`sbx_exec`**, which print the command and become
   no-ops under `--dry-run`. `sbx_probe` is the deliberate exception: it queries state, stays
   silent, and is only called when `DRY_RUN` is 0.
+- **Never drive a loop from a pipe when the body runs `sbx exec`.** `sbx exec` inherits the
+  loop's stdin and drains it, so `jq … | while read -r name` registered only the *first* MCP
+  server and skipped the rest silently — no error, no warning. Collect into an array first
+  (`while read` over a heredoc, body free of stdin consumers), then iterate that. `sbx_probe`
+  additionally closes stdin. The one place stdin is load-bearing is the secret-carrying
+  `sbx exec -i`, which must not get a `</dev/null`.
+- **`sbx secret set` is interactive when the secret exists** ("Overwrite? (y/N)") and a piped
+  value answers the *prompt* instead of becoming the secret, so the write is cancelled while
+  looking fine. The step checks `sbx secret ls` (columns: SCOPE TYPE NAME) and skips what is
+  already there. `-f/--force` only works with `--token`, which would put the secret in argv.
 - **Non-fatal by design.** Provisioning steps `|| warn` rather than `die`, so an unsupported
   `sbx` subcommand degrades instead of aborting a half-built sandbox. Only preflight and
   profile-resolution errors `die`.

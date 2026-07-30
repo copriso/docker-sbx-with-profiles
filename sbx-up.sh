@@ -176,11 +176,13 @@ sbx_exec() {
 }
 
 # Same, but quiet and without dry-run suppression — used for probing state.
+# stdin is closed: a probe never needs it, and inheriting a loop's stdin lets it
+# swallow the input that loop is still reading.
 sbx_probe() {
   if [ -n "$SBX_EXEC_SEP" ]; then
-    sbx exec "$SANDBOX_NAME" "$SBX_EXEC_SEP" "$@" >/dev/null 2>&1
+    sbx exec "$SANDBOX_NAME" "$SBX_EXEC_SEP" "$@" >/dev/null 2>&1 </dev/null
   else
-    sbx exec "$SANDBOX_NAME" "$@" >/dev/null 2>&1
+    sbx exec "$SANDBOX_NAME" "$@" >/dev/null 2>&1 </dev/null
   fi
 }
 
@@ -273,13 +275,24 @@ else
   # global value for this sandbox only.
   for entry in ${SANDBOX_SECRETS[@]+"${SANDBOX_SECRETS[@]}"}; do
     svc="${entry%%=*}"; cmd="${entry#*=}"
-    log "secret: setting '$svc' (sandbox scope)"
     if [ "$DRY_RUN" -eq 1 ]; then
+      log "secret: setting '$svc' (sandbox scope)"
       printf '%s  $ <%s> | sbx secret set %s %s%s\n' "$c_dim" "$cmd" "$SANDBOX_NAME" "$svc" "$c_off" >&2
     else
+      # `sbx secret set` prompts "Overwrite? (y/N)" when the secret exists, and a
+      # piped value answers that prompt instead of becoming the secret — so the
+      # write is cancelled and only looks like it worked. Skip what is already
+      # there; replacing one is a deliberate `sbx secret set <sandbox> <service>`.
+      if sbx secret ls 2>/dev/null \
+         | awk -v s="$SANDBOX_NAME" -v n="$svc" '$1==s && $3==n {f=1} END{exit !f}'; then
+        log "secret: '$svc' already set for '$SANDBOX_NAME' — keeping it"
+        continue
+      fi
+      log "secret: setting '$svc' (sandbox scope)"
       val="$(eval "$cmd")" || { warn "could not produce value for '$svc'"; continue; }
       [ -n "$val" ] || { warn "empty value for '$svc' — skipped"; continue; }
-      printf '%s' "$val" | sbx secret set "$SANDBOX_NAME" "$svc" || warn "secret set failed for '$svc'"
+      printf '%s' "$val" | sbx secret set "$SANDBOX_NAME" "$svc" \
+        || warn "secret set failed for '$svc'"
       unset val
     fi
   done
@@ -335,8 +348,17 @@ printf "%s\n" "$DEST" > "$HOME/.sbx-up-repo"
   # Existing servers with the same name are left alone.
   if [ -n "$MCP_FILE" ]; then
     log "mcp: applying servers from $(basename "$MCP_FILE")"
-    jq -r '(.mcpServers // .) | keys[]' "$MCP_FILE" | while IFS= read -r name; do
-      [ -n "$name" ] || continue
+    # Collect the names *before* looping. Reading them straight off a pipe leaves
+    # the loop body's stdin attached to that pipe, and `sbx exec` in the body
+    # drains it — which silently registered only the first server and skipped the
+    # rest with no error at all. The inner loop below consumes no stdin.
+    MCP_NAMES=()
+    while IFS= read -r n; do
+      [ -n "$n" ] && MCP_NAMES+=("$n")
+    done <<EOF
+$(jq -r '(.mcpServers // .) | keys[]' "$MCP_FILE")
+EOF
+    for name in ${MCP_NAMES[@]+"${MCP_NAMES[@]}"}; do
       if [ "$DRY_RUN" -eq 0 ] && sbx_probe "$AGENT" mcp get "$name"; then
         log "mcp: '$name' already registered — keeping it"
         continue
@@ -361,7 +383,12 @@ printf "%s\n" "$DEST" > "$HOME/.sbx-up-repo"
           skip_server=1
           break
         fi
-        spec="$(printf '%s' "$spec" | jq -c --arg k "$envvar" --arg v "$val" '.env[$k] = $v')"
+        if ! spec="$(printf '%s' "$spec" | jq -c --arg k "$envvar" --arg v "$val" '.env[$k] = $v')"; then
+          warn "mcp: could not merge $envvar into '$name' — skipping it"
+          skip_server=1
+          unset val
+          break
+        fi
         unset val
       done
       [ "$skip_server" -eq 1 ] && continue
