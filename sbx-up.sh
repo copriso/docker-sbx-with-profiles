@@ -9,10 +9,15 @@
 #   ./sbx-up.sh work --reprovision          # re-run provisioning on an existing sandbox
 #   ./sbx-up.sh work --dry-run              # print every command, change nothing
 #   ./sbx-up.sh work --no-attach            # provision only
+#   ./sbx-up.sh work --workspace /path/to/x # override the profile's workspace
 #   ./sbx-up.sh work -- --branch=my-feature # everything after -- goes to `sbx run`
 #
+# A profile that leaves WORKSPACE empty uses the directory you ran from.
+#
 # Idempotent: if the sandbox already exists it is reused and provisioning is
-# skipped (a marker file inside the VM records that it already ran).
+# skipped (a marker file inside the VM records that it already ran). The
+# workspace is fixed when the sandbox is created and cannot be changed by a
+# later run — a different directory needs a different SANDBOX_NAME.
 #
 # Written for bash 3.2 so it works on stock macOS. No associative arrays.
 
@@ -29,6 +34,7 @@ DRY_RUN=0
 REPROVISION=0
 ATTACH=1
 REPO_OVERRIDE=""
+WORKSPACE_OVERRIDE=""
 PROFILE=""
 RUN_ARGS=()
 
@@ -68,6 +74,7 @@ while [ $# -gt 0 ]; do
     --reprovision) REPROVISION=1; shift ;;
     --no-attach)   ATTACH=0; shift ;;
     --repo)        REPO_OVERRIDE="${2:?--repo needs a value}"; shift 2 ;;
+    --workspace)   WORKSPACE_OVERRIDE="${2:?--workspace needs a value}"; shift 2 ;;
     --)            shift; RUN_ARGS=("$@"); break ;;
     -*)            die "unknown flag: $1 (see --help)" ;;
     *)
@@ -107,6 +114,34 @@ WARN_ON_HOST_API_KEY=1
 
 [ -n "$SANDBOX_NAME" ] || SANDBOX_NAME="$PROFILE"
 [ -n "$REPO_OVERRIDE" ] && CLONE_REPO="$REPO_OVERRIDE"
+[ -n "$WORKSPACE_OVERRIDE" ] && WORKSPACE="$WORKSPACE_OVERRIDE"
+
+# A profile that leaves WORKSPACE empty runs against the directory you invoked
+# the script from, the way `sbx create claude .` does. The path is mounted at
+# the same location inside the VM, so it is resolved to an absolute one here.
+WORKSPACE_FROM_CWD=0
+if [ -z "$WORKSPACE" ]; then
+  WORKSPACE="$PWD"
+  WORKSPACE_FROM_CWD=1
+  log "workspace: not set in profile — using current directory"
+fi
+case "$WORKSPACE" in
+  /*)   : ;;
+  ./*)  WORKSPACE="$PWD/${WORKSPACE#./}" ;;
+  *)    WORKSPACE="$PWD/$WORKSPACE" ;;
+esac
+if [ -e "$WORKSPACE" ] && [ ! -d "$WORKSPACE" ]; then
+  die "workspace exists but is not a directory: $WORKSPACE"
+fi
+# The isolation pattern in the README is an empty scratch dir plus an in-VM
+# clone, so a missing workspace is created rather than treated as an error.
+if [ ! -d "$WORKSPACE" ]; then
+  log "workspace: $WORKSPACE does not exist — creating it"
+  run mkdir -p "$WORKSPACE"
+fi
+# Collapse `..` and symlinks so the host and in-VM mount paths agree. Skipped
+# when the directory was only pretend-created under --dry-run.
+[ -d "$WORKSPACE" ] && WORKSPACE="$(cd "$WORKSPACE" && pwd)"
 
 if [ -n "$MCP_FILE" ]; then
   case "$MCP_FILE" in
@@ -180,10 +215,16 @@ fi
 FRESH=0
 if sandbox_exists; then
   log "sandbox '$SANDBOX_NAME' already exists — reusing it"
+  # The workspace is bound at creation time. When it came from the current
+  # directory, a run from somewhere else looks like it rebound the mount but
+  # did not — worth saying out loud. 'sbx ls' shows the real one.
+  if [ "$WORKSPACE_FROM_CWD" -eq 1 ]; then
+    warn "workspace was bound when it was created — this run does NOT remount"
+    warn "$WORKSPACE. Check 'sbx ls'; another directory needs another SANDBOX_NAME."
+  fi
 else
-  log "creating sandbox '$SANDBOX_NAME'"
-  create_cmd=(sbx create "$AGENT")
-  [ -n "$WORKSPACE" ] && create_cmd+=("$WORKSPACE")
+  log "creating sandbox '$SANDBOX_NAME' with workspace $WORKSPACE"
+  create_cmd=(sbx create "$AGENT" "$WORKSPACE")
   create_cmd+=(--name "$SANDBOX_NAME")
   [ -n "$KIT_DIR" ] && create_cmd+=(--kit "$KIT_DIR")
   [ "${#EXTRA_CREATE_ARGS[@]}" -gt 0 ] && create_cmd+=("${EXTRA_CREATE_ARGS[@]}")
@@ -206,15 +247,24 @@ if [ "$NEED_PROVISION" -eq 0 ]; then
 else
 
   # --- network policy ------------------------------------------------------
+  # `policy init` sets the *global* initial policy for every sandbox and is a
+  # one-time operation — re-running it after initialisation fails, so this only
+  # warns. `sbx policy reset` is the way to start over.
   if [ -n "$POLICY_INIT" ]; then
-    log "network: initialising policy '$POLICY_INIT'"
-    run sbx policy init "$POLICY_INIT" || warn "policy init failed — check 'sbx policy --help'"
+    log "network: initialising global policy '$POLICY_INIT' (applies to all sandboxes)"
+    run sbx policy init "$POLICY_INIT" \
+      || warn "policy init failed — already initialised? 'sbx policy reset' starts over"
   fi
+  # One rule, comma-separated, scoped to this sandbox. Without --sandbox the
+  # rule would apply globally to every sandbox and defeat per-profile isolation.
   if [ "${#ALLOW_DOMAINS[@]}" -gt 0 ]; then
-    log "network: allowing ${#ALLOW_DOMAINS[@]} domain(s)"
+    domain_list=""
     for d in "${ALLOW_DOMAINS[@]}"; do
-      run sbx policy allow "$SANDBOX_NAME" "$d" || warn "could not allow $d"
+      domain_list="${domain_list:+$domain_list,}$d"
     done
+    log "network: allowing ${#ALLOW_DOMAINS[@]} host(s) for '$SANDBOX_NAME' only"
+    run sbx policy allow network --sandbox "$SANDBOX_NAME" "$domain_list" \
+      || warn "could not apply network rules — check 'sbx policy allow network --help'"
   fi
 
   # --- sandbox-scoped secrets ---------------------------------------------

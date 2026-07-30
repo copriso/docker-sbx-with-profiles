@@ -17,6 +17,7 @@ no test suite, and no dependency manifest.
 ./sbx-up.sh private --repo <url>           # ad-hoc repo for this run
 ./sbx-up.sh work --reprovision             # force re-run of provisioning
 ./sbx-up.sh work --no-attach               # provision only
+./sbx-up.sh work --workspace /path         # override the profile's WORKSPACE
 ./sbx-up.sh work -- --branch=my-feature    # everything after `--` goes to `sbx run`
 
 shellcheck sbx-up.sh                       # the only linting that applies here
@@ -45,6 +46,25 @@ The script is one linear pipeline, in this order, with section banners marking e
 5. **provisioning**: network policy → sandbox-scoped secrets → custom secrets → repo clone
    → MCP servers → `post_create()` → write marker.
 6. **attach**: `sbx run <sandbox> [RUN_ARGS]`.
+
+An empty `WORKSPACE` resolves to `$PWD` (`--workspace` overrides), so a profile need not
+hardcode a directory. The mount is bound at `sbx create` time only — reuse never remounts,
+which is why the reuse path warns when the workspace came from the cwd.
+
+### Verified `sbx` surface (checked 2026-07, don't re-guess)
+
+```
+sbx create <agent> PATH [PATH...] [--name N] [--kit REF] [--clone] [--template] [--profile]
+sbx policy init <allow-all|balanced|deny-all>        # GLOBAL, one-time; reset to redo
+sbx policy allow network [--sandbox S] "h1,h2,..."   # no --sandbox ⇒ applies to ALL sandboxes
+sbx secret set [-g | SANDBOX] [SERVICE]              # value on stdin
+sbx exec [flags] SANDBOX COMMAND [ARG...]            # `--` separator undocumented
+sbx ls [-q|--json]
+```
+
+Extra `PATH`s on `create` accept a `:ro` suffix — that is the way to expose a directory
+outside `WORKSPACE` (e.g. an stdio MCP server's install dir), via `EXTRA_CREATE_ARGS`.
+`ALLOW_DOMAINS` is applied as one comma-separated `--sandbox`-scoped call, not a loop.
 
 ### Invariants to preserve
 
@@ -95,6 +115,6 @@ kit instead — the create call happens earlier and only once.
 - `.gitignore` ignores `profiles/*`; the two checked-in profiles were force-added as
   examples. New profiles need `git add -f` to be tracked, and they are the place real
   hostnames and repo URLs land — check before committing one.
-- The README's "Three things to check against your sbx build" documents guesses the author
-  could not verify (`sbx policy allow` argument order, the `sbx exec` separator,
-  `sbx secret set-custom` flags). Treat those call sites as provisional.
+- The README's "Two things to check against your sbx build" documents what remains
+  unverified: the `sbx exec` separator (`SBX_EXEC_SEP`) and `sbx secret set-custom`'s
+  flags. Treat those two call sites as provisional; the rest is confirmed above.
