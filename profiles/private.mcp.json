@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    },
+    "home-assistant": {
+      "type": "http",
+      "url": "http://ha.local:8123/mcp_server/sse"
+    }
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": ["-y", "@upstash/context7-mcp"]
+    },
+    "postgres-staging": {
+      "command": "docker",
+      "args": ["run", "-i", "--rm", "-e", "DATABASE_URI", "mcp/postgres"],
+      "env": {
+        "DATABASE_URI": "postgresql://user@staging.corp.example.com/appdb"
+      }
+    },
+    "corp-wiki": {
+      "type": "http",
+      "url": "https://wiki.corp.example.com/mcp"
+    }
+  }
+}
