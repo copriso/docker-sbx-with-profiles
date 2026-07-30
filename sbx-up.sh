@@ -102,6 +102,7 @@ REQUIRED_GLOBAL_SECRETS=()
 SANDBOX_SECRETS=()          # "service=shell command producing the value"
 CUSTOM_SECRETS=()           # "ENV_VAR|host|shell command producing the value"
 MCP_FILE=""
+MCP_ENV_SECRETS=()          # "server|ENV_VAR|shell command producing the value"
 CLONE_REPO=""
 CLONE_DEST=""               # expanded *inside* the VM, so $HOME is the VM's
 CLONE_DEPTH=""
@@ -341,9 +342,46 @@ printf "%s\n" "$DEST" > "$HOME/.sbx-up-repo"
         continue
       fi
       spec="$(jq -c --arg n "$name" '(.mcpServers // .)[$n]' "$MCP_FILE")"
+
+      # Env values the server needs that deliberately are *not* in the JSON:
+      # produced by a command now and merged into .env, so a profile stores the
+      # command and never the secret itself.
+      secret_count=0
+      skip_server=0
+      for entry in ${MCP_ENV_SECRETS[@]+"${MCP_ENV_SECRETS[@]}"}; do
+        srv="${entry%%|*}"; rest="${entry#*|}"
+        envvar="${rest%%|*}"; cmd="${rest#*|}"
+        [ "$srv" = "$name" ] || continue
+        secret_count=$((secret_count + 1))
+        [ "$DRY_RUN" -eq 1 ] && { log "mcp: '$name' env $envvar <- <$cmd>"; continue; }
+        val="$(eval "$cmd")" || val=""
+        if [ -z "$val" ]; then
+          warn "mcp: no value for $envvar from: $cmd"
+          warn "mcp: skipping '$name' — better absent than registered half-configured"
+          skip_server=1
+          break
+        fi
+        spec="$(printf '%s' "$spec" | jq -c --arg k "$envvar" --arg v "$val" '.env[$k] = $v')"
+        unset val
+      done
+      [ "$skip_server" -eq 1 ] && continue
+
       log "mcp: adding '$name'"
-      sbx_exec "$AGENT" mcp add-json "$name" "$spec" -s user \
-        || warn "could not add MCP server '$name'"
+      if [ "$secret_count" -gt 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+        # The spec now carries a secret, so it goes over stdin: never in argv
+        # (visible to `ps` on the host and in the VM) and never printed.
+        exec_cmd=(sbx exec -i "$SANDBOX_NAME")
+        [ -n "$SBX_EXEC_SEP" ] && exec_cmd+=("$SBX_EXEC_SEP")
+        printf '%s  $ <spec, %d secret(s) merged> | %s sh -c %s mcp add-json %s -s user%s\n' \
+          "$c_dim" "$secret_count" "${exec_cmd[*]}" "$AGENT" "$name" "$c_off" >&2
+        printf '%s\n' "$spec" | "${exec_cmd[@]}" \
+          sh -c 'IFS= read -r spec; exec "$1" mcp add-json "$0" "$spec" -s user' "$name" "$AGENT" \
+          || warn "could not add MCP server '$name'"
+      else
+        sbx_exec "$AGENT" mcp add-json "$name" "$spec" -s user \
+          || warn "could not add MCP server '$name'"
+      fi
+      unset spec
     done
   fi
 

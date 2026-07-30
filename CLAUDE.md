@@ -90,12 +90,23 @@ outside `WORKSPACE` (e.g. an stdio MCP server's install dir), via `EXTRA_CREATE_
 `profiles/<name>.env` sets: `AGENT`, `SANDBOX_NAME` (defaults to the profile name),
 `WORKSPACE`, `KIT_DIR`, `POLICY_INIT`, `ALLOW_DOMAINS[]`, `REQUIRED_GLOBAL_SECRETS[]`,
 `SANDBOX_SECRETS[]` (`"service=command producing the value"`), `CUSTOM_SECRETS[]`
-(`"ENV_VAR|host|command producing the value"`), `MCP_FILE`, `CLONE_REPO`/`CLONE_DEST`/
+(`"ENV_VAR|host|command producing the value"`), `MCP_FILE`, `MCP_ENV_SECRETS[]`
+(`"server|ENV_VAR|command producing the value"`), `CLONE_REPO`/`CLONE_DEST`/
 `CLONE_DEPTH`/`CLONE_BRANCH`, `EXTRA_CREATE_ARGS[]`, `WARN_ON_HOST_API_KEY`.
 
 Secret values are never stored in profiles — only the command that produces them
 (`gh auth token`, `security find-generic-password`, `pass show`), `eval`'d at provisioning
-time and piped straight into `sbx secret set`.
+time and piped straight into `sbx secret set`. `MCP_ENV_SECRETS` extends that rule to MCP
+config, which would otherwise be the one place a plaintext token had to live: the value is
+merged into the server's `.env` with `jq`, then the spec goes to the VM over **stdin**
+(`sbx exec -i … sh -c 'IFS= read -r spec; …'`) so it never reaches argv or a printed
+command. Keep it that way — a secret in `sbx_exec` arguments would be echoed by `run`.
+A lookup that produces nothing skips the server rather than registering it half-configured.
+
+Extra host directories reach the VM as additional `sbx create` paths in
+`EXTRA_CREATE_ARGS` (`/path:ro`), mounted at their host paths; `sbx cp` in `post_create()`
+is the copy-based alternative. An stdio MCP server outside `WORKSPACE` needs its
+dependency tree mounted at its real path too, not just its entry point.
 
 `MCP_FILE` paths are relative to `PROFILE_DIR`; `KIT_DIR` is relative to `SCRIPT_DIR`.
 MCP JSON accepts either a `{"mcpServers": {...}}` wrapper or a bare server map — the `jq`

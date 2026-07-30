@@ -24,6 +24,7 @@ secrets  sbx secret set <sandbox> <service>          (sandbox-scoped)
          sbx secret set-custom ...                   (experimental)
 repo     git clone inside the VM, into $HOME/repos/<name>
 mcp      claude mcp add-json <name> <json> -s user   inside the VM
+         MCP_ENV_SECRETS values merged in first, passed over stdin
 hook     post_create() from the profile
 attach   sbx run <profile>
 ```
@@ -69,21 +70,71 @@ remount, so per-directory sandboxes need distinct `SANDBOX_NAME`s.
 Anything else your build supports goes in `EXTRA_CREATE_ARGS` — check
 `sbx create --help`, since I deliberately didn't model flags I couldn't verify.
 
-## Two things to check against your sbx build
+### Getting extra files in
+
+Three ways, in order of how often you want them:
+
+1. **Extra workspaces, at creation** — `sbx create` takes more than one path, each
+   mounted at the same path it has on the host, `:ro` for read-only. This is what
+   `EXTRA_CREATE_ARGS` is for:
+
+   ```bash
+   EXTRA_CREATE_ARGS=(/Volumes/dev/tool:ro /Volumes/dev/tool/node_modules:ro)
+   ```
+
+   Nothing is copied, edits on the host are visible immediately, and size is
+   irrelevant. Mount the narrowest set of directories that works, not a repo root —
+   whatever you mount is readable inside the sandbox.
+2. **`sbx cp <src> <sandbox>:<dst>`, after creation** — a snapshot, so it drifts and
+   has to be re-copied. Right for a handful of files (a global `CLAUDE.md`, a config);
+   wrong for a dependency tree. Use `-L` if the source has symlinks, and put it in
+   `post_create()` so `--reprovision` redoes it.
+3. **Kits (`KIT_DIR`, experimental)** — declarative YAML bundling files, env vars,
+   network policy and startup commands, applied at creation and mounted read-only.
+   The right home for team-wide defaults; heavier than it's worth for one file.
+
+An stdio MCP server whose `command` is a host path needs option 1 or 2, and needs its
+dependencies too. A `dist/index.js` that imports bare specifiers resolves them by
+walking up from its own directory, so the `node_modules` those imports land in must be
+mounted at its real path as well — see `profiles/dashbrd.env` for a worked example.
+
+## MCP servers that need a token
+
+Keep the token out of the `.mcp.json`. List the env var and the command that
+produces it in `MCP_ENV_SECRETS`, and it is merged into that server's `env` at
+provisioning time:
+
+```bash
+MCP_ENV_SECRETS=(
+  "kan-bn|KAN_API_TOKEN|security find-generic-password -s sbx-dashbrd-kan -w"
+)
+```
+
+Same rule as every other secret here: the profile stores the command, never the
+value. Store the token once with
+
+```bash
+security add-generic-password -a "$USER" -s sbx-dashbrd-kan -w <token> -U
+```
+
+A spec carrying a merged secret is handed to the VM on **stdin** rather than as an
+argument, so the token never appears in a printed command or in `ps` output on either
+side. If the command yields nothing, the server is skipped rather than registered
+half-configured, with a warning naming the failing lookup.
+
+## One thing to check against your sbx build
 
 Verified against `sbx` as of 2026-07: `policy init <allow-all|balanced|deny-all>`,
 `policy allow network [--sandbox S] <host,host,...>`, `secret set [-g | SANDBOX]
-[SERVICE]`, `create <agent> PATH [PATH...] [--name] [--kit]`, `ls -q`. These two
-are still unconfirmed, and each is a one-line fix:
+[SERVICE]`, `create <agent> PATH [PATH...] [--name] [--kit]`, `ls -q`, `cp`, and
+`exec` — including that `sbx exec <name> -- <cmd>` and `sbx exec <name> <cmd>` behave
+identically, both passing flag-like arguments such as `-s user` through untouched.
+`SBX_EXEC_SEP=""` remains available if a future build stops accepting `--`.
 
-1. **The `sbx exec` separator.** Defaults to `sbx exec <name> -- <cmd>`, but
-   `sbx exec --help` documents `sbx exec [flags] SANDBOX COMMAND [ARG...]` with no
-   separator. The `--` matters because MCP registration passes `-s user`, which
-   bare `sbx exec` may try to parse as its own flag. Check with
-   `sbx exec <name> -- true; echo $?` and if it fails, run with
-   `SBX_EXEC_SEP="" ./sbx-up.sh work`.
-2. **`sbx secret set-custom`** is documented as experimental, so its flags may
-   have drifted. `CUSTOM_SECRETS` is empty by default.
+One is still unconfirmed:
+
+- **`sbx secret set-custom`** is documented as experimental, so its flags may
+  have drifted. `CUSTOM_SECRETS` is empty by default.
 
 Run `--dry-run` first and read the commands before letting it touch anything.
 
